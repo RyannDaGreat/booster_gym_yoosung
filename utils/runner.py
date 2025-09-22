@@ -9,6 +9,7 @@ import signal
 import imageio
 import torch
 import torch.nn.functional as F
+import pdb
 from utils.model import *
 from utils.buffer import ExperienceBuffer
 from utils.utils import discount_values, surrogate_loss
@@ -29,9 +30,12 @@ class Runner:
 
         self.device = self.cfg["basic"]["rl_device"]
         self.learning_rate = self.cfg["algorithm"]["learning_rate"]
-        self.model = ActorCritic(self.env.num_actions, self.env.num_obs, self.env.num_privileged_obs).to(self.device)
+        # self.model = ActorCritic(self.env.num_actions, self.env.num_obs, self.env.num_privileged_obs).to(self.device)
+        self.model = ActorCriticV2(self.env.num_actions, self.env.num_obs, self.env.num_privileged_obs, self.env.upper_body_dof_indices.tolist()).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self._load()
+
+        # self._load_motion()  # Motion loading now handled by environment
 
         self.buffer = ExperienceBuffer(self.cfg["runner"]["horizon_length"], self.env.num_envs, self.device)
         self.buffer.add_buffer("actions", (self.env.num_actions,))
@@ -96,18 +100,77 @@ class Runner:
         except Exception as e:
             print(f"Failed to load optimizer: {e}")
 
+    # def _load_motion(self):
+    #     # Motion loading now handled by environment
+    #     filepath = self.cfg["motion"]["file"]
+    #     if not filepath:
+    #         raise ValueError("No motion file provided.")
+    #     import pickle
+    #     with open(filepath, "rb") as f:
+    #         motion = pickle.load(f)
+    #     motion = motion[next(iter(motion))]
+
+    #     # Keep motion data on CPU initially, will move to CUDA when accessed
+    #     for k in motion:
+    #         if isinstance(motion[k], np.ndarray):
+    #             motion[k] = torch.from_numpy(motion[k]).float()
+
+    #     # Convert absolute joint positions to action space (relative to default)
+    #     # motion["dof"] is now absolute positions, convert to actions
+    #     motion["dof"] = (motion["dof"] - self.env.default_dof_pos.cpu()) / self.cfg["control"]["action_scale"]
+
+    #     self.motion = motion
+    #     self.motion_fps = self.cfg["motion"]["fps"]
+
+    #     # Adjust motion length to match control frequency
+    #     control_dt = self.cfg["control"]["decimation"] * self.cfg["sim"]["dt"]
+    #     motion_dt = 1.0 / self.motion_fps
+    #     motion_time_scale = motion_dt / control_dt
+    #     self.motion_len = int(motion["dof"].shape[0] * motion_time_scale)
+
     def train(self):
+        # Motion handling now moved to environment
+        # # Calculate motion time step based on FPS mismatch
+        # control_dt = self.env.dt  # This already includes decimation
+        # motion_dt = 1.0 / self.motion_fps
+        # motion_time_scale = motion_dt / control_dt
+
         self.recorder = Recorder(self.cfg)
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
         privileged_obs = infos["privileged_obs"].to(self.device)
+
+        # try:
         for it in range(self.cfg["basic"]["max_iterations"]):
             # within horizon_length, env.step() is called with same act
+            # Motion progression now handled automatically by environment
+            # # within horizon_length, env.step() is called with same act
+            # # motion_start_frame = torch.randint(0, self.motion["dof"].shape[0] - self.cfg["runner"]["horizon_length"], (self.env.num_envs,))
+
+            # # Set initial DOF positions to match motion start frame
+            # initial_dof_positions = self.motion["dof"][motion_start_frame].to(self.device)
+            # # self.env.set_dof_positions(initial_dof_positions)
+
+            # for n in range(self.motion_len):
             for n in range(self.cfg["runner"]["horizon_length"]):
+
                 self.buffer.update_data("obses", n, obs)
                 self.buffer.update_data("privileged_obses", n, privileged_obs)
                 with torch.no_grad():
                     dist = self.model.act(obs)
+                    # Motion override now handled automatically by environment
+                    # # NOTE: Update mean values of upper body.
+                    # modified_mean = dist.mean.clone()
+
+                    # # # Calculate corresponding motion frame based on time scaling
+                    # # motion_frame = motion_start_frame + min(int(n / motion_time_scale), self.motion["dof"].shape[0] - 1)
+                    # # # Load motion to CUDA when accessed at motion_frame
+                    # # motion_dof_frame = self.motion["dof"][motion_frame][:, self.env.upper_body_dof_indices.cpu()].to(self.device)
+                    # # modified_mean[:, self.env.upper_body_dof_indices] = motion_dof_frame
+
+                    # # Create new distribution with modified mean
+                    # modified_dist = torch.distributions.Normal(modified_mean, dist.stddev)
+                    # act = modified_dist.sample()
                     act = dist.sample()
                 obs, rew, done, infos = self.env.step(act)
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
@@ -213,6 +276,10 @@ class Runner:
                     it + 1,
                 )
             print("epoch: {}/{}".format(it + 1, self.cfg["basic"]["max_iterations"]))
+        # except Exception as e:
+        #     import traceback
+        #     traceback.print_exc()
+        #     pdb.set_trace()
 
     def play(self):
         obs, infos = self.env.reset()
